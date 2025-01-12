@@ -119,34 +119,54 @@ def refresh_access_token():
     使用 refresh token 更新 access token
     """
     global access_token, token_expires_in, refresh_token
-    app = get_auth_app()
-    result = app.acquire_token_by_refresh_token(refresh_token, SCOPE)
-    if "access_token" in result:
-        access_token = result['access_token']
-        token_expires_in = result.get('expires_in', 3600)
-        refresh_token = result.get('refresh_token', refresh_token)
-        # 更新儲存的 token 資訊
-        save_token({
-            'access_token': access_token,
-            'refresh_token': refresh_token,
-            'expires_in': token_expires_in,
-            'timestamp': datetime.datetime.now().timestamp()
-        })
-        return True
-    return False
+    try:
+        app = get_auth_app()
+        result = app.acquire_token_by_refresh_token(refresh_token, SCOPE)
+        
+        if "access_token" in result:
+            access_token = result['access_token']
+            token_expires_in = result.get('expires_in', 3600)
+            refresh_token = result.get('refresh_token', refresh_token)
+            
+            # 更新儲存的 token 資訊
+            save_token({
+                'access_token': access_token,
+                'refresh_token': refresh_token,
+                'expires_in': token_expires_in,
+                'timestamp': datetime.datetime.now().timestamp()
+            })
+            return True
+        else:
+            logger.error(f"更新 Token 失敗: {result.get('error_description', '未知錯誤')}")
+            return False
+    except Exception as e:
+        logger.error(f"更新 Token 時發生錯誤: {str(e)}")
+        return False
 
 def get_access_token():
     """
     取得 Microsoft Graph API 的存取權杖
     """
-    global access_token
+    global access_token, refresh_token, token_expires_in
     
     # 嘗試載入已儲存的 token
     token_data = load_token()
-    if token_data and 'access_token' in token_data:
-        # 直接使用已存在的 token
+    if token_data:
         logger.info("使用已存在的 token")
         access_token = token_data['access_token']
+        refresh_token = token_data['refresh_token']
+        token_expires_in = token_data['expires_in']
+        timestamp = token_data['timestamp']
+        
+        # 檢查 token 是否過期（提前5分鐘更新）
+        if datetime.datetime.now().timestamp() - timestamp > token_expires_in - 300:
+            logger.info("Token 即將過期，嘗試更新")
+            if refresh_access_token():
+                logger.info("Token 更新成功")
+                return access_token
+            else:
+                logger.error("Token 更新失敗，請在 Windows 端重新獲取 token")
+                return None
         return access_token
 
     logger.error("找不到有效的 token，請在 Windows 端執行程式獲取 token，並將 token.json 複製到此目錄")
@@ -377,6 +397,69 @@ async def send_daily_schedule():
         import traceback
         logger.error(traceback.format_exc())
 
+def check_and_refresh_token():
+    """
+    檢查並更新 token，返回下一次需要檢查的分鐘數
+    如果沒有 token 或更新失敗，返回 None
+    """
+    try:
+        token_data = load_token()
+        if not token_data:
+            logger.error("找不到有效的 token，請在 Windows 端執行程式獲取 token，並將 token.json 複製到此目錄")
+            return None
+            
+        timestamp = token_data['timestamp']
+        expires_in = token_data['expires_in']
+        current_time = datetime.datetime.now().timestamp()
+        
+        # 計算剩餘時間（秒）
+        remaining_time = expires_in - (current_time - timestamp)
+        
+        # 如果剩餘時間少於 5 分鐘，立即更新
+        if remaining_time < 300:
+            logger.info("定期檢查：Token 即將過期，嘗試更新")
+            if refresh_access_token():
+                logger.info("定期檢查：Token 更新成功")
+                # 更新成功後，設定下次檢查時間為 55 分鐘後（3300 秒）
+                return 55
+            else:
+                logger.error("定期檢查：Token 更新失敗，請在 Windows 端重新獲取 token")
+                return None
+        else:
+            # 計算下次檢查時間：剩餘時間減去 5 分鐘的緩衝時間，再轉換為分鐘
+            next_check = (remaining_time - 300) / 60
+            logger.info(f"Token 仍然有效，剩餘 {remaining_time/60:.1f} 分鐘，將在 {next_check:.1f} 分鐘後檢查")
+            return next_check
+    except Exception as e:
+        logger.error(f"檢查 Token 時發生錯誤: {str(e)}")
+        return None
+
+def schedule_next_token_check(minutes):
+    """
+    排程下一次的 token 檢查
+    """
+    # 清除所有已排程的 token 檢查
+    schedule.clear('token_check')
+    
+    # 計算下次執行時間
+    next_time = datetime.datetime.now() + datetime.timedelta(minutes=minutes)
+    next_time_str = next_time.strftime("%H:%M:%S")
+    
+    # 排程下次檢查
+    schedule.every().day.at(next_time_str).do(check_and_schedule_token).tag('token_check')
+    logger.info(f"已排程下次 Token 檢查時間：{next_time_str}")
+
+def check_and_schedule_token():
+    """
+    檢查 token 並排程下一次檢查
+    如果檢查失敗，終止程式
+    """
+    minutes = check_and_refresh_token()
+    if minutes is None:
+        logger.error("Token 驗證失敗，程式終止")
+        os._exit(1)
+    schedule_next_token_check(minutes)
+
 def main():
     """
     主程式
@@ -399,6 +482,9 @@ def main():
     schedule.every().day.at("06:00").do(lambda: asyncio.run(send_daily_schedule()))
     
     logger.info("行事曆提醒機器人已啟動")
+    
+    # 立即執行一次 token 檢查並排程下一次檢查
+    check_and_schedule_token()
     
     while True:
         try:
